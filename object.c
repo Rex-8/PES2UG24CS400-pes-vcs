@@ -94,9 +94,59 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    const char *type_str = (type == OBJ_BLOB) ? "blob" :
+                           (type == OBJ_TREE) ? "tree" : "commit";
+
+    // Step 1: Build full object = header + data
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    // header_len does NOT include the null byte, but we need it in the object
+    size_t full_len = header_len + 1 + len;  // +1 for the \0
+    uint8_t *full = malloc(full_len);
+    if (!full) return -1;
+    memcpy(full, header, header_len);
+    full[header_len] = '\0';
+    memcpy(full + header_len + 1, data, len);
+
+    // Step 2: Hash the full object
+    compute_hash(full, full_len, id_out);
+
+    // Step 3: Deduplication
+    if (object_exists(id_out)) {
+        free(full);
+        return 0;
+    }
+
+    // Step 4: Create shard directory
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/objects/%.2s", PES_DIR,
+             path + strlen(OBJECTS_DIR) + 1);
+    mkdir(dir, 0755);
+
+    // Step 5: Write to temp file
+    char tmp[520];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) { free(full); return -1; }
+    if (write(fd, full, full_len) != (ssize_t)full_len) {
+        close(fd); free(full); return -1;
+    }
+
+    // Step 6: fsync
+    fsync(fd);
+    close(fd);
+    free(full);
+
+    // Step 7: Atomic rename
+    if (rename(tmp, path) != 0) return -1;
+
+    // Step 8: fsync the directory
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+
+    return 0;
 }
 
 // Read an object from the store.
@@ -122,7 +172,57 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    // Step 1: Get path
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    // Step 2: Read entire file
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    uint8_t *buf = malloc(file_size);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, file_size, f) != (size_t)file_size) {
+        fclose(f); free(buf); return -1;
+    }
+    fclose(f);
+
+    // Step 4: Verify integrity FIRST
+    ObjectID computed;
+    compute_hash(buf, file_size, &computed);
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(buf); return -1;
+    }
+
+    // Step 3: Parse header — find the \0
+    uint8_t *null_pos = memchr(buf, '\0', file_size);
+    if (!null_pos) { free(buf); return -1; }
+
+    // Parse type string and size from header
+    char type_str[16];
+    size_t data_size;
+    if (sscanf((char *)buf, "%15s %zu", type_str, &data_size) != 2) {
+        free(buf); return -1;
+    }
+
+    // Step 5: Set type
+    if      (strcmp(type_str, "blob")   == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree")   == 0) *type_out = OBJ_TREE;
+    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
+    else { free(buf); return -1; }
+
+    // Step 6: Copy data portion (after the \0)
+    uint8_t *data_start = null_pos + 1;
+    size_t actual_data_len = file_size - (data_start - buf);
+    *data_out = malloc(actual_data_len + 1);
+    if (!*data_out) { free(buf); return -1; }
+    memcpy(*data_out, data_start, actual_data_len);
+    ((uint8_t *)*data_out)[actual_data_len] = '\0';
+    *len_out = actual_data_len;
+
+    free(buf);
+    return 0;
 }
